@@ -3,66 +3,72 @@ import requests
 from bs4 import BeautifulSoup
 import numpy as np
 import faiss
-import re
+import os
 from sentence_transformers import SentenceTransformer
 from groq import Groq
-import os
 
-# ----------------------------
-# CONFIG
-# ----------------------------
-st.set_page_config(page_title="Web RAG with Groq", layout="wide")
-
-st.title("🌐 Web-based RAG Application")
-st.write("Ask questions from live web pages using Retrieval-Augmented Generation (RAG).")
-
-# ----------------------------
-# API KEY
-# ----------------------------
-st.sidebar.header("🔑 Groq API Key")
-groq_key = st.sidebar.text_input(
-    "Enter your Groq API Key",
-    type="password"
+# --------------------------------------------------
+# PAGE CONFIG
+# --------------------------------------------------
+st.set_page_config(
+    page_title="Web RAG Application",
+    layout="wide"
 )
 
-if groq_key:
-    os.environ["GROQ_API_KEY"] = groq_key
+st.title("🌐 Web-based RAG Application")
+st.caption("Ask questions from live webpages using Retrieval-Augmented Generation (RAG)")
 
-# ----------------------------
-# INITIALIZE MODELS
-# ----------------------------
+# --------------------------------------------------
+# LOAD GROQ API KEY (FROM STREAMLIT SECRETS / ENV)
+# --------------------------------------------------
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+if not GROQ_API_KEY:
+    st.error("❌ GROQ_API_KEY not found. Please set it in Streamlit Secrets.")
+    st.stop()
+
+# --------------------------------------------------
+# LOAD MODELS (CACHED)
+# --------------------------------------------------
 @st.cache_resource
 def load_embedder():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
-embedder = load_embedder()
-
+@st.cache_resource
 def load_llm():
-    return Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    return Groq(api_key=GROQ_API_KEY)
 
-# ----------------------------
-# WEB LOADER (CLEAN)
-# ----------------------------
-def load_web_page(url):
+embedder = load_embedder()
+client = load_llm()
+
+# --------------------------------------------------
+# WEB PAGE LOADER (CLEAN CONTENT)
+# --------------------------------------------------
+def load_web_page(url: str) -> str:
     headers = {"User-Agent": "Mozilla/5.0"}
-    html = requests.get(url, headers=headers, timeout=10).text
-    soup = BeautifulSoup(html, "html.parser")
+    response = requests.get(url, headers=headers, timeout=10)
+    response.raise_for_status()
 
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # Remove noisy elements
     for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
         tag.decompose()
 
+    # Prefer main/article content
     main = soup.find("article") or soup.find("main")
     text = main.get_text(" ") if main else soup.get_text(" ")
+
     return " ".join(text.split())
 
-# ----------------------------
+# --------------------------------------------------
 # CHUNKING WITH NOISE CONTROL
-# ----------------------------
+# --------------------------------------------------
 def chunk_text(
-    text,
-    chunk_size=400,
-    overlap=80,
-    min_words=120
+    text: str,
+    chunk_size: int = 400,
+    overlap: int = 80,
+    min_words: int = 120
 ):
     words = text.split()
     chunks = []
@@ -73,6 +79,7 @@ def chunk_text(
         chunk_words = words[start:end]
         chunk = " ".join(chunk_words)
 
+        # Filters to reduce noise
         if len(chunk_words) >= min_words and chunk.count(".") >= 2:
             chunks.append(chunk)
 
@@ -80,9 +87,9 @@ def chunk_text(
 
     return chunks
 
-# ----------------------------
-# BUILD FAISS
-# ----------------------------
+# --------------------------------------------------
+# BUILD FAISS INDEX
+# --------------------------------------------------
 def build_faiss(chunks):
     embeddings = embedder.encode(chunks, show_progress_bar=False)
     embeddings = np.array(embeddings).astype("float32")
@@ -92,18 +99,18 @@ def build_faiss(chunks):
     index.add(embeddings)
     return index
 
-# ----------------------------
+# --------------------------------------------------
 # RETRIEVAL
-# ----------------------------
+# --------------------------------------------------
 def retrieve(query, index, chunks, k=5):
     q_emb = embedder.encode([query]).astype("float32")
     faiss.normalize_L2(q_emb)
-    _, idx = index.search(q_emb, k)
-    return [chunks[i] for i in idx[0]]
+    _, indices = index.search(q_emb, k)
+    return [chunks[i] for i in indices[0]]
 
-# ----------------------------
+# --------------------------------------------------
 # PROMPT
-# ----------------------------
+# --------------------------------------------------
 def build_prompt(context, question):
     return f"""
 You are a document-based assistant.
@@ -121,50 +128,50 @@ Question:
 Answer:
 """
 
-# ----------------------------
+# --------------------------------------------------
 # RAG PIPELINE
-# ----------------------------
+# --------------------------------------------------
 def ask_web_rag(question, index, chunks):
-    retrieved = retrieve(question, index, chunks)
-    context = "\n\n".join(retrieved)
+    retrieved_chunks = retrieve(question, index, chunks)
+    context = "\n\n".join(retrieved_chunks)
 
     prompt = build_prompt(context, question)
 
-    client = load_llm()
     response = client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2
     )
 
-    return response.choices[0].message.content, retrieved
+    return response.choices[0].message.content, retrieved_chunks
 
-# ----------------------------
+# --------------------------------------------------
 # STREAMLIT UI
-# ----------------------------
+# --------------------------------------------------
 url = st.text_input("🌍 Enter Web URL")
 question = st.text_input("❓ Ask a question")
 
 if st.button("Run RAG"):
-    if not groq_key:
-        st.error("Please enter your Groq API Key.")
-    elif not url or not question:
+    if not url or not question:
         st.warning("Please enter both URL and question.")
     else:
-        with st.spinner("Processing webpage..."):
-            text = load_web_page(url)
-            chunks = chunk_text(text)
+        with st.spinner("🔎 Processing webpage and building RAG pipeline..."):
+            try:
+                text = load_web_page(url)
+                chunks = chunk_text(text)
 
-            if not chunks:
-                st.error("No meaningful content found on this page.")
-            else:
-                index = build_faiss(chunks)
-                answer, sources = ask_web_rag(question, index, chunks)
+                if not chunks:
+                    st.error("No meaningful content found on this webpage.")
+                else:
+                    index = build_faiss(chunks)
+                    answer, sources = ask_web_rag(question, index, chunks)
 
-                st.subheader("✅ Answer")
-                st.write(answer)
+                    st.subheader("✅ Answer")
+                    st.write(answer)
 
-                st.subheader("📌 Retrieved Context")
-                for i, src in enumerate(sources, 1):
-                    st.markdown(f"**Chunk {i}:** {src[:300]}...")
+                    st.subheader("📌 Retrieved Context")
+                    for i, src in enumerate(sources, 1):
+                        st.markdown(f"**Chunk {i}:** {src[:300]}...")
 
+            except Exception as e:
+                st.error(f"Error: {e}")
